@@ -1,13 +1,15 @@
-# lemmonbot-maintenance skill
+# customerservice-sales-bot skill
 
-A [Claude Code](https://claude.com/claude-code) skill distilling the methodology and hard-won gotchas from building and maintaining a WhatsApp/Telegram support+sales chatbot on **n8n + Chatwoot**, both self-hosted.
+A [Claude Code](https://claude.com/claude-code) skill for building and maintaining a **free, self-hosted customer-service + sales chatbot** on **n8n + Chatwoot** — no per-seat SaaS licensing, just a small VPS.
 
-This is **not** a copy of any specific bot's workflow, and contains **no credentials, tokens, server addresses, or business data**. It's a reusable reference for the *patterns* that came up repeatedly: safely editing a large stateful Code node through a REST API, avoiding a nasty escape-sequence corruption bug across multi-layer tool pipelines, patching a self-hosted app's frontend without breaking its build, and diagnosing "it's down" reports methodically.
+Covers the whole lifecycle: architecture, how to wire the bot up to external APIs (CRM/billing lookups, calendar booking, team-chat alerts), the conversation state-machine design patterns, safely editing a large automation workflow through its REST API without corrupting it, patching a self-hosted app's frontend, and diagnosing "it's down" reports.
+
+Contains **no credentials, tokens, server addresses, or business-specific data** — it's a reusable reference for the *patterns*, not a copy of any one bot.
 
 ## Install
 
-Drop the `.claude/skills/lemmonbot-maintenance/` folder into a project (or your global `~/.claude/skills/`), and Claude Code will pick it up automatically.
+Drop the `.claude/skills/customerservice-sales-bot/` folder into a project (or your global `~/.claude/skills/`), and Claude Code will pick it up automatically.
 
 ## Contents
 
-- `.claude/skills/lemmonbot-maintenance/SKILL.md` — the skill itself.
+- `.claude/skills/customerservice-sales-bot/SKILL.md` — the skill itself.

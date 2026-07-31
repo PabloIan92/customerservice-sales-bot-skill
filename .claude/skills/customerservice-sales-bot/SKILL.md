@@ -1,0 +1,120 @@
+---
+name: customerservice-sales-bot
+description: How to build and maintain a free, self-hosted customer-service + sales chatbot (WhatsApp/Telegram/Email/web) using n8n + Chatwoot on your own servers, including how to wire it up to external APIs (CRM/billing, calendars, team chat alerts). Use when designing a new bot from scratch, connecting it to an external service, or editing/debugging an existing n8n+Chatwoot bot's conversation logic.
+---
+
+# Customer Service & Sales Bot (n8n + Chatwoot, self-hosted, free)
+
+This skill captures the **architecture, integration patterns, and hard-won gotchas** for building and maintaining a customer-support-and-sales chatbot on **n8n + Chatwoot**, both self-hosted on your own server — no per-seat SaaS licensing, no paid bot-platform subscription. It does **not** contain any credentials, tokens, server addresses, or business-specific data. Adapt the concrete node names, states, and business rules to whatever bot you're actually building; what matters is the *pattern*.
+
+## Why this stack, and what it costs
+
+- **Chatwoot** (open source, self-hosted) is the omnichannel inbox: it normalizes WhatsApp, Telegram, email, and a web widget into one "conversation" concept, gives human agents a UI to take over from the bot, and exposes a full REST API for reading/writing conversations, contacts, and their custom attributes.
+- **n8n** (open source, self-hosted) is the automation/orchestration engine: it receives Chatwoot's outgoing webhook on every new message, runs your decision logic, calls whatever external APIs you need, and posts the reply back through Chatwoot's API.
+- The only recurring cost is the VM itself (a small VPS is plenty for low-to-medium volume — see sizing notes below). Everything else (the two apps, the automation logic, unlimited conversations) is free and yours to run.
+- This is a genuine alternative to paid conversational-bot platforms for teams that are comfortable operating a Linux server and want full control over logic and data.
+
+## Minimum viable architecture
+
+```
+WhatsApp/Telegram/Email/Web  →  Chatwoot (inbox + agent UI + REST API)
+                                     │  outgoing webhook, on every new message
+                                     ▼
+                                 n8n workflow
+                                     │
+                     ┌───────────────┼────────────────┐
+                     │               │                │
+              Webhook trigger   Code node          HTTP Request /
+              (filter: only    (the "brain":       credentialed nodes
+               incoming,        decide state +      (external APIs:
+               message_created) reply + action)      CRM, calendar,
+                                     │                team-chat alerts)
+                                     ▼
+                          Switch/IF node keyed on
+                          the decided "action" name
+                                     │
+                     ┌───────────────┼────────────────┐
+                     ▼               ▼                ▼
+              action A node   action B node     (no action: just
+              (e.g. call      (e.g. book        send the reply)
+               CRM API)        appointment)
+                     └───────────────┴────────────────┘
+                                     ▼
+                     HTTP Request → post reply to Chatwoot
+                     HTTP Request → save new conversation state
+                       (custom_attributes) back to Chatwoot
+```
+
+Build it in this order: Chatwoot first (get a channel receiving real messages), then a trivial n8n workflow that just echoes back "got it" to prove the webhook plumbing works end-to-end, then grow the Code node's logic incrementally state by state.
+
+### The two n8n patterns that matter most
+
+1. **Keep the decision-making Code node pure.** It should not itself make external API calls for side effects (sending a payment link, rebooting a device, booking a calendar slot). Instead it decides three things per turn: the reply text, the next conversation state, and a symbolic `accion` name if a side effect is needed. A `Switch` node downstream, keyed on that `accion` value, routes to small dedicated nodes that each do exactly one side effect. This keeps the core logic testable in isolation and means one broken integration can't take down message classification for everyone.
+2. **Conversation state lives in the chat platform, not in n8n.** Store a `conversation_state` (or similarly named) value in the conversation's custom attributes after every turn. n8n itself is stateless between executions — the entire "memory" of where a customer is in the flow is whatever you read back out of Chatwoot at the start of the next message. This is what lets you scale to many concurrent conversations without any external database.
+
+## Connecting to external APIs — the general recipes
+
+Almost every external integration reduces to one of these shapes:
+
+- **Static API key.** Simplest case: every request carries a fixed header (`Authorization: ApiKey ...` or similar). Store it in n8n's built-in encrypted credential store and reference it from any node type that supports a credential picker (e.g. the HTTP Request node), rather than typing it into a Code node's source.
+- **Token exchange (username/password → bearer token).** Common for CRM/billing backends: `POST` credentials to a login/token endpoint, get back a short- or long-lived bearer token, then send `Authorization: Bearer <token>` on subsequent calls. For a low-volume bot it's usually fine to just fetch a fresh token on every action rather than building token-caching — simplicity beats a small amount of extra latency.
+- **OAuth2 / service account, for platforms like Google.** For a shared resource like a booking calendar, a **service account** (a JSON key you generate once in the provider's console and hand to n8n's credential type for that service) avoids ever needing a human to click through a consent screen, and works well for server-to-server automation that isn't tied to one person's account.
+- **Incoming webhook, for one-way alerts.** The simplest possible integration: a team-chat platform's "incoming webhook" URL that accepts a plain `POST {"text": "..."}`. No auth flow at all — perfect for internal alerting (escalations, risk flags, appointment notifications) where you're not reading anything back.
+- **Never put real secrets directly in a Code node's source if you can avoid it.** A Code node can't use n8n's credential-picker UI the way other node types can, so if it must call an authenticated API directly, prefer passing the secret in via an upstream `Set`/environment-variable node rather than a literal string — and treat the exported workflow JSON itself as sensitive, since it will contain whatever you typed there.
+
+### Recipes worth stealing
+
+- **Identify-then-enrich.** Ask for one natural identifying detail (national ID number, phone, order/account number), look the customer up in the CRM/billing API, and merge every useful field it returns into the conversation's custom attributes in one shot. Every later state can then reference `attrs.customer_name`, `attrs.balance_due`, etc. without re-querying.
+- **Calendar-as-source-of-truth for booking.** Don't build your own slot-availability database. Generate candidate time blocks programmatically (e.g. "next 5 weekdays, two half-day blocks each"), cross-check them against the calendar API's "list events in range" call to drop anything already booked, and present only what's actually free. Creating an appointment means creating a calendar event with a descriptive title/description containing everything a human would need (customer name, contact info, address, whatever's relevant) — the calendar event itself becomes the operational record, no separate database required.
+- **Reprogram = delete + recreate, cancel = delete.** If a customer wants to reschedule an existing booking, create the new calendar event first, then delete the old one by its stored event ID — don't delete-then-create, or a failure between the two steps loses the booking entirely with nothing to fall back on.
+- **Human handoff via the chat platform's own primitives.** Use the chat platform's own "assign to team", "toggle open/resolved", and "post an internal-only note" API calls to hand a conversation to a human — don't build a parallel ticketing system. Gate the bot's reply logic so that once a conversation is in a "handed off" state, it goes quiet (posts nothing) rather than talking over the human agent — except for a deliberate staleness check (e.g. "it's been N hours with no human reply, resume automated handling") so conversations can't get stuck in permanent bot-silence if a handoff never gets actioned.
+- **Menus accept both the number and its synonyms.** For every numbered menu option, also match a handful of natural-language ways someone might describe wanting that option ("1. Facturas y pagos" should also fire on "quiero pagar", "mi factura", etc.), so the bot doesn't feel rigid to someone who ignores the numbers entirely.
+- **Escalate to AI only for open-ended stuff, never for menu navigation.** Deterministic keyword/number matching for anything with a small fixed set of expected answers (menus, yes/no, numbered choices); hand off to an LLM step only for genuinely open-ended free text, and always inject the concrete facts it needs (exact prices, the customer's real name, business rules) into that turn's instruction — don't rely on a model's memory of the conversation, and see below for why a small dedicated AI step often beats bolting instructions onto a shared one.
+
+## The state-machine Code node
+
+Each incoming message re-runs the whole Code node from scratch: it reads the previous state, looks at the message content, and decides a new state + reply + optional `accion`.
+
+- **Critical gotcha — authoritative last-write.** If a downstream node does a final "save custom attributes" call using an expression like `Object.assign({}, preTurnSnapshot, extraOut, {conversation_state: newState})`, then **any direct API call made *inside* the Code node itself to update custom attributes gets silently clobbered** by that later write — it only knows about the pre-turn snapshot plus whatever you routed through the shared "extra output" object. Any flag that must persist has to flow through that object, never only via a side-channel API call from inside the Code node.
+- **Critical gotcha — substring vs. word-boundary matching.** If your keyword-matching helper does plain substring search, never pass it short, common tokens — "no" is a substring of "bueno"/"good"-in-other-languages-too, "si"/"yes" can be a substring of unrelated words. For short ambiguous words, use exact equality instead, and reserve substring matching for longer, more specific phrases.
+- **Order matters for accept/reject detection.** When distinguishing "customer accepted" vs "rejected" vs "ambiguous", check rejection keywords *before* acceptance keywords if a compound reply could contain both ("yes, but I'd still rather cancel").
+- **"Transient" states must actually reset.** If a state value like "let the AI answer this one message" is meant to be transient, make sure whatever persists state afterward does *not* write that transient value back as the durable next state — otherwise the conversation gets stuck with no matching branch, silently falling through to a generic fallback forever.
+- **Contact-level vs. conversation-level data.** If customer identity and per-conversation state live in different records (a "contact" vs. a "conversation"), merge logic that copies contact-level facts into the conversation should not be gated on unrelated fields being empty — a common bug is "only backfill contact data if the conversation doesn't already have a customer ID yet", which silently breaks for already-identified returning customers on a related but different field.
+- **3-strikes-then-escalate.** For any free-text state where the bot might genuinely not understand, track a small per-conversation retry counter and escalate to a human after a few failures rather than looping or guessing forever. Reset the counter whenever the customer is successfully understood again.
+
+## Safe workflow-editing loop (via the platform's REST API)
+
+When editing a large Code node's source through a script rather than an IDE:
+
+1. **Fetch fresh** — always re-GET the current workflow JSON right before editing; don't reuse a stale copy from earlier.
+2. **Locate by exact substring, never by retyping.** Verify `code.count(anchor) == 1` (or exactly the expected count) *before* replacing. A `.replace()` "succeeding" against the wrong number of matches silently corrupts something else.
+3. **Extract, don't retype, anything with escape sequences or non-ASCII characters.** Large source files often mix encoding styles inconsistently (raw UTF-8 emoji/accents in some sections, literal `\uXXXX` escape text in others). Slice the exact existing bytes out of the fetched source and only mutate the plain-ASCII portions you actually need to change.
+4. **Construct new escape sequences (like `\n`) programmatically, not literally.** Build them with `chr(92) + "n"` (or your language's equivalent) rather than typing the literal two-character sequence in your script. Multi-layer tool/shell pipelines (heredocs, SSH, nested quoting) can silently turn a literal backslash-n into a real newline before it reaches the target file, corrupting a string literal into invalid syntax — invisible in your own source, only showing up as a syntax error downstream.
+5. **Deploy ritual**: PUT the updated workflow → deactivate → activate (PUT alone often doesn't hot-reload) → re-GET to confirm the change landed.
+6. **Always syntax-check before calling it done.** Pull the deployed code back out and run it through your language's syntax checker wrapped in a bare function shell. This is the single highest-leverage safety net here — it catches brace-mismatches and encoding corruption before they reach production, where a broken Code node can mean the bot stops responding to every message.
+7. **If you do introduce a syntax error anyway**, count brace/paren depth programmatically through the suspect region to pinpoint the exact offset where it goes negative or fails to return to zero, rather than eyeball-diffing a large generated block.
+
+## Testing changes
+
+- Keep one dedicated test conversation that you reset between rounds via a direct API call to clear its custom attributes to a known starting state.
+- After any deploy, actually drive a test conversation through the new logic — syntax-valid code can still have wrong business logic, wrong state names, or wrong field names.
+- When a live test reveals unexpected behavior, pull the actual conversation history and current custom-attribute values via the API and reconstruct exactly which branch fired, before concluding "the AI is unreliable" (it's often a deterministic routing bug instead).
+
+## Self-hosting infrastructure notes
+
+- A small VPS (a few dollars a month) comfortably runs both Chatwoot and n8n for low-to-medium message volume. The main constraint to plan around is **build-time**, not run-time: a frontend production build on a 1-vCPU box can exceed the JS runtime's default heap size and crash with an out-of-memory error unrelated to actual available RAM — explicitly raise the heap limit for build commands rather than assuming you need a bigger box.
+- If the server doesn't have a stable public IP/domain with TLS already sorted, a zero-config mesh-networking tunnel (or any reverse-tunnel service) is the fastest way to get a stable HTTPS URL for the webhook endpoints without touching firewall/DNS.
+- A cron-based watchdog for network flakiness (detect the interface lost its address, remediate automatically, alert only on state *change* rather than on every check) prevents both silent extended outages and alert fatigue from a chatty always-on check.
+- Any change made directly to a self-hosted app's own source (a custom UI feature Chatwoot itself doesn't have, for example) will be overwritten or conflict on the next update. Save each such patch as its own diff file with the exact rebuild/restart procedure written next to it, so reapplying it after an upgrade is a five-minute mechanical task, not a rediscovery project. Also: a systemd unit's declared `PATH` env var is not gospel — check what the actual running process resolves versus what a login shell resolves, since version managers are often set up via shell-login hooks a bare non-login shell won't run; invoke build commands through a login shell if that's what the service itself uses.
+
+## Diagnosing "it's down" reports
+
+- **Check the actual service first**, locally on the server, before assuming the public-facing issue and the backend issue are the same thing. A tunnel/proxy can be down while the app underneath is perfectly healthy, and vice versa.
+- **Read the actual request logs around the reported time** rather than guessing. A slow/hung request (e.g. one validating an external connection with no timeout) can look to a user exactly like "the whole app crashed."
+- **A misconfigured field (wrong port, a typo) is a far more common root cause than an actual outage** — check the literal parameters of whatever action was being performed when things "broke" before escalating to infrastructure-level debugging.
+
+## General working style for this kind of bot
+
+- Business-logic corrections often arrive as quick corrections to something just shipped ("that's backwards", "don't say X there") — treat these as direct, authoritative specification, verify the current code reflects the correction precisely, and redeploy promptly rather than batching them.
+- When someone distinguishes between two similar-looking flows (e.g. "the closing message for an existing customer relocating isn't the closing message for a brand-new sale"), that's a signal two logically distinct paths share code that needs to diverge — branch the shared code rather than editing one path in a way that silently changes the other too.
+- Before implementing a "show me X" request for a UI panel or report, check what data is actually queryable/stored right now versus what would need new instrumentation — don't silently under-deliver by omitting a requested field, and don't silently fabricate one that doesn't exist. Say plainly which parts are ready now and which need a new data source.
