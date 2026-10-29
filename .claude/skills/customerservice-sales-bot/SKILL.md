@@ -305,3 +305,44 @@ When timeouts affect only some customers, resist the first plausible theory. A s
 ## Customer-facing tone is a configuration decision, make it explicit
 
 In markets where tuteo/voseo reads as too familiar for a service provider, write customer messages in the formal register (usted) and keep it consistent between the bot's templates, macros, canned replies and any message a person or an assistant writes by hand. Decide it once and record it, because the default register of a model or of copied templates drifts back to informal.
+
+## Build a live call-center wallboard from raw call events
+
+When a cloud PBX exposes only per-extension ring, answer, and hangup webhooks, keep an append-only event table rather than trying to maintain a shared live-call record inside concurrent executions. After returning the webhook's 200 response, branch to record the timestamp, call id, event, result, extension, agent, and only the last four digits of the number. Recording must never delay or break the PBX response. At read time, replay events per call and extension as `ringing → in call → free`. Mark a call lost only after every extension that rang has been released and none answered; ignore outbound legs that appear as hangups without a prior ring. Expire dangling calls after a bounded timeout (for example, 30 minutes) so an absent final event cannot leave an agent busy forever. Use separate live and report endpoints: read roughly the last 36 hours for live state, and the requested report period plus a one-day margin for reports. Every query needs a bounded time window.
+
+## Deduplicate call events only within a short retry window
+
+A queue can ring the same extension again under the same call id, so a later event with the same call id, type, and extension may be a real state transition. One first hangup meant the queue moved on; a second hangup minutes later ended the agent's answered leg. Suppressing both as duplicates left the agent shown as in a call until the stale-call timeout. Keep the raw events and, when replaying them, discard a repeat only if it arrives within a few seconds of the previous identical event, consistent with a vendor retry. Test the rule against the complete timestamped event sequence from a real incident, including re-rings and final hangup.
+
+## Define supervisor KPIs from the same call classification
+
+A wallboard is useful only if its numbers match the call states underneath it. Show service level as calls answered within the configured wait threshold divided by answered plus lost calls; exclude calls still sounding from the denominator. Add abandonment percentage, current queue length and oldest wait, answered calls per agent today, calls per hour, 90th-percentile wait, and average handle time. Define each metric's time window and denominator once on the server, and use the same boundary comparison (`≤` or `<`) in every endpoint and screen. Otherwise one call at the threshold can be counted differently on the live board and report.
+
+## Keep wallboard goals in one server-side configuration row
+
+When a supervisor changes a target on one screen, every other screen, including a TV, must reflect the same rule within the next refresh. Store the service-level target and wait seconds, maximum abandonment, warning and urgent wait thresholds, long-call minutes, and business hours in one table row. Have every endpoint read and return that row, and calculate service level with its current threshold on the server rather than changing only a displayed label. Validate individual ranges and cross-field rules such as urgent wait greater than warning wait and closing time later than opening time. Record who changed the settings.
+
+## n8n workflow details that distort a polling dashboard
+
+- **Auxiliary table reads must run once.** A Data Table `get` node downstream of N items executes N times. Set `executeOnce` for shared reads such as configuration and reason lists, or duplicated items multiply counts and work.
+- **Design browser requests around the Webhook node's methods.** Its trigger does not accept `OPTIONS`. Configure the webhook's allowed origins and CORS headers on the Respond node; use `GET` for reads and form-encoded `POST` for writes so ordinary browser requests avoid a preflight.
+- **Test token generation in n8n's Code node.** Its sandbox may expose neither `crypto` nor `require('crypto')`, even when the same code works in local Node. Verify the actual workflow runtime before choosing a secure token-generation method.
+- **Verify the active workflow after API edits.** With a draft/publish model, an API update alone may leave the published version unchanged. Activate or publish as required, then re-fetch the active version and compare it with the intended change.
+- **Derive event deduplication from stored rows.** Workflow static data is not a reliable shared dedupe store when webhook executions overlap; apply the short retry window while reading the event table.
+- **Turn off successful-execution saving for high-frequency polling workflows.** A dashboard refreshing every few seconds otherwise floods the execution log; keep failures visible.
+
+## Reuse helpdesk accounts for an admin-only dashboard login
+
+Proxy sign-in through the automation platform and check that the authenticated user has the admin role on the intended helpdesk account. Support both direct success and a second step that accepts an MFA token plus a six-digit code. Immediately sign out the helpdesk session created for verification: helpdesks may cap sessions per user and evict the oldest one. Issue a separate cryptographically random dashboard session token with an expiry, short by default and longer for an explicit keep-me-signed-in choice on a wall TV; never return the helpdesk API token. Disable execution-data saving for the login workflow so submitted passwords do not remain in its log. Enforce failed-attempt lockouts by both email and originating IP at the dashboard layer, because proxied helpdesk logins all arrive from one server IP and share its per-IP rate limit.
+
+## Add a static dashboard beside the helpdesk without risking its proxy
+
+When serving a small dashboard on the helpdesk host, add a static `location /<dashboard-path>/ { alias ...; }` before the catch-all proxy location. Back up the site file, run `nginx -t`, and reload only after the test succeeds; restore the backup automatically on failure. Reload rather than restart to preserve active traffic. A request immediately after reload may still reach an old worker, so repeat the route check before deciding the new location failed.
+
+## Make production workflow changes reversible and observable
+
+A workflow update can validate yet still change the live call path incorrectly. Have deployment scripts simulate by default, dump the proposed JSON, run the official workflow validator, back up everything they modify, re-read the active result after applying, and provide a `--revert` path. Split the deployment so any part touching live call handling runs outside business hours. After each applied step, perform one real end-to-end check with production data and inspect its actual output before proceeding.
+
+## Keep live boards and reports readable on screen and paper
+
+Give the live board and reports one visual language, such as a dark brand band above a light body. Show status with icon and text as well as color, so it remains understandable in print and to people who cannot distinguish the colors. In print mode, redraw charts at paper width instead of merely shrinking the screen canvas. Explain empty and error states in plain words. When checking mobile screenshots with a headless browser, verify its actual minimum window width: some capture setups keep a viewport around 476 pixels even when asked for 400, making an otherwise sound mobile layout appear cut off.
